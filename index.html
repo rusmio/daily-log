@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#f6f5f1" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Daily Log">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="style.css">
+<title>Daily Log</title>
+</head>
+<body>
+<header class="top">
+  <h1 id="title">Сегодня</h1>
+  <span id="subtitle"></span>
+</header>
+
+<main>
+  <section id="view-today" class="view"></section>
+  <section id="view-trends" class="view" hidden></section>
+  <section id="view-data" class="view" hidden></section>
+</main>
+
+<nav class="tabs">
+  <button type="button" data-tab="today" class="active">Сегодня</button>
+  <button type="button" data-tab="trends">Динамика</button>
+  <button type="button" data-tab="data">Данные</button>
+</nav>
+
+<dialog id="meal-dialog">
+  <form id="meal-form">
+    <div class="sheet-head">
+      <h2 id="meal-title" tabindex="-1" autofocus>Приём пищи</h2>
+      <button type="button" class="ghost" data-act="close-meal">Закрыть</button>
+    </div>
+
+    <label class="field">
+      <span>Когда</span>
+      <input type="datetime-local" name="ts" required>
+    </label>
+
+    <fieldset>
+      <legend>Голод до еды <output id="before-label"></output></legend>
+      <div class="scale" data-scale="before"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Сытость после <output id="after-label"></output></legend>
+      <div class="scale" data-scale="after"></div>
+      <p class="hint">Можно оценить позже: запись появится в блоке «Оценить сытость».</p>
+    </fieldset>
+
+    <label class="switch">
+      <input type="checkbox" name="mindful">
+      <span>Ела осознанно<small>сидя, без экрана, хотя бы первые 5 минут</small></span>
+    </label>
+
+    <fieldset>
+      <legend>Контекст</legend>
+      <div class="chips" id="ctx-chips"></div>
+    </fieldset>
+
+    <label class="field">
+      <span>Заметка</span>
+      <textarea name="note" rows="2" placeholder="необязательно"></textarea>
+    </label>
+
+    <div class="sheet-actions">
+      <button type="button" class="ghost danger" data-act="delete-meal" hidden>Удалить</button>
+      <button type="submit" class="primary">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<input type="file" id="import-file" accept=".json,application/json" hidden>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
