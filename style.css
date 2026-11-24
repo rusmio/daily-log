@@ -168,10 +168,6 @@ legend output { font-weight: 400; color: var(--ink-2); margin-left: 6px; }
   min-height: 44px;
 }
 
-.switch { display: flex; gap: 12px; align-items: center; margin-top: 16px; }
-.switch input { width: 24px; height: 24px; accent-color: var(--accent); flex: none; }
-.switch small { display: block; color: var(--ink-2); font-size: 13px; }
-
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
   min-height: 36px;

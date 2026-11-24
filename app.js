@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.1.0';
 
 const SCALE = {
   1: 'истощение, слабость',
@@ -14,7 +14,6 @@ const SCALE = {
   9: 'тяжесть',
   10: 'переела, дискомфорт',
 };
-const CONTEXTS = ['усталость', 'скука', 'стресс', 'награда', 'на ходу', 'за ребёнком', 'за компанией', 'перед экраном'];
 const STORES = ['meals', 'notes', 'days', 'focus', 'weights'];
 const LS_DEFAULT_WAKE = 'daily-log:default-wake';
 const TABLE_DAYS = 30;
@@ -22,9 +21,10 @@ const TABLE_DAYS = 30;
 const state = { meals: [], notes: [], days: {}, focus: {}, weights: [] };
 let db;
 let currentTab = 'today';
-let draft = null;       // черновик приёма пищи (шкалы, теги)
+let draft = null;       // черновик приёма пищи (шкалы)
 let noteDraftId = null;
 let diaryFilter = 'all';
+let exportBusy = false; // защита кнопок экспорта от двойного нажатия
 
 // ---------- utils ----------
 
@@ -246,16 +246,12 @@ function diaryRow(it) {
   const t = timeStr(new Date(it.ts));
   if (it.kind === 'meal') {
     const m = it.ref;
-    const tags = [];
-    if (m.mindful) tags.push('осознанно');
-    tags.push(...(m.ctx || []));
     const after = m.after == null
       ? '<span class="pending">оценить сытость</span>'
       : `сытость <b>${m.after}</b>`;
-    const tail = m.note ? ` · «${esc(m.note)}»` : '';
     return `<button type="button" class="entry" data-act="edit-meal" data-id="${esc(m.id)}">
       <span class="row"><span class="time">${t}</span><span>🍽 голод <b>${m.before}</b> → ${after}</span></span>
-      ${tags.length ? `<span class="tags">${esc(tags.join(' · '))}${tail}</span>` : m.note ? `<span class="tags">«${esc(m.note)}»</span>` : ''}
+      ${m.note ? `<span class="tags">«${esc(m.note)}»</span>` : ''}
     </button>`;
   }
   if (it.kind === 'note') {
@@ -294,7 +290,7 @@ function renderDiary() {
 
   keys.forEach((k) => {
     const label = k === today ? `Сегодня, ${humanDate(k)}` : k === ykey ? `Вчера, ${humanDate(k)}` : humanDate(k);
-    const rows = groups.get(k).sort((a, b) => a.ts - b.ts).map(diaryRow).join('');
+    const rows = groups.get(k).sort((a, b) => b.ts - a.ts).map(diaryRow).join('');
     html += `<div class="day-group" id="day-${k}"><p class="day-head">${label}</p>${rows}</div>`;
   });
 
@@ -309,7 +305,6 @@ function dayStats(key) {
     n: ms.length,
     before: avg(ms.map((m) => m.before)),
     after: rated.length ? avg(rated.map((m) => m.after)) : null,
-    mindful: ms.filter((m) => m.mindful).length,
     wake: state.days[key] && state.days[key].wake,
   };
 }
@@ -349,14 +344,13 @@ function renderDynamics() {
   const stats = [...keys].sort().reverse().slice(0, TABLE_DAYS).map(dayStats);
 
   html += `<div class="card"><h2>По дням</h2><div class="table-wrap"><table>
-    <thead><tr><th>День</th><th>Подъём</th><th>Приёмы</th><th>Голод</th><th>Сытость</th><th>Осозн.</th></tr></thead>
+    <thead><tr><th>День</th><th>Подъём</th><th>Приёмы</th><th>Голод</th><th>Сытость</th></tr></thead>
     <tbody>${stats.map((s) => `<tr data-act="diary-day" data-day="${s.key}">
       <td>${shortDate(s.key)} ${DOW[parseKey(s.key).getDay()]}</td>
       <td>${s.wake ? timeStr(new Date(s.wake)) : '—'}</td>
       <td>${s.n || '—'}</td>
       <td>${fmt1(s.before)}</td>
-      <td>${s.after == null ? '—' : fmt1(s.after)}</td>
-      <td>${s.n ? `${s.mindful}/${s.n}` : '—'}</td></tr>`).join('')}
+      <td>${s.after == null ? '—' : fmt1(s.after)}</td></tr>`).join('')}
     </tbody></table></div>
     <p class="hint">Тап по строке — открыть день во «Дневнике». Голод и сытость — средние за день.</p></div>`;
 
@@ -511,7 +505,6 @@ function syncSheet() {
     form.querySelectorAll(`[data-kind="${kind}"]`).forEach((b) => b.setAttribute('aria-pressed', String(draft[kind] === Number(b.dataset.val))));
     $(`#${kind}-label`).textContent = draft[kind] ? `${draft[kind]} — ${SCALE[draft[kind]]}` : '';
   });
-  form.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-pressed', String(draft.ctx.has(c.dataset.val))));
 }
 
 function openMeal(id) {
@@ -520,12 +513,10 @@ function openMeal(id) {
     id: m ? m.id : null,
     before: m ? m.before : null,
     after: m ? m.after : null,
-    ctx: new Set(m ? m.ctx || [] : []),
   };
   const form = $('#meal-form');
   const d = m ? new Date(m.ts) : new Date();
   form.ts.value = `${dateKey(d)}T${timeStr(d)}`;
-  form.mindful.checked = m ? !!m.mindful : false;
   form.note.value = m ? m.note || '' : '';
   $('#meal-title').textContent = m ? 'Приём пищи' : 'Новый приём пищи';
   $('[data-act="delete-meal"]').hidden = !m;
@@ -545,8 +536,6 @@ async function saveMeal(e) {
     ts: d.getTime(),
     before: draft.before,
     after: draft.after,
-    mindful: form.mindful.checked,
-    ctx: [...draft.ctx],
     note: form.note.value.trim(),
   };
   await put('meals', meal);
@@ -686,7 +675,7 @@ async function shareFile(name, text, type) {
   const file = new File([text], name, { type });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try {
-      await navigator.share({ files: [file], title: name });
+      await navigator.share({ files: [file] });
       return true;
     } catch (e) {
       if (e.name === 'AbortError') return false;
@@ -703,20 +692,26 @@ async function shareFile(name, text, type) {
 }
 
 async function exportJson() {
-  const data = {
-    app: 'daily-log',
-    version: 2,
-    exportedAt: new Date().toISOString(),
-    meals: state.meals,
-    notes: state.notes,
-    days: Object.values(state.days),
-    focus: Object.values(state.focus),
-    weights: state.weights,
-  };
-  const ok = await shareFile(`daily-log-${dateKey(new Date())}.json`, JSON.stringify(data, null, 1), 'application/json');
-  if (ok) {
-    toast('Копия готова');
-    render();
+  if (exportBusy) return;
+  exportBusy = true;
+  try {
+    const data = {
+      app: 'daily-log',
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      meals: state.meals.map((m) => ({ id: m.id, ts: m.ts, before: m.before, after: m.after, note: m.note })),
+      notes: state.notes,
+      days: Object.values(state.days),
+      focus: Object.values(state.focus),
+      weights: state.weights,
+    };
+    const ok = await shareFile(`daily-log-${dateKey(new Date())}.json`, JSON.stringify(data, null, 1), 'application/json');
+    if (ok) {
+      toast('Копия готова');
+      render();
+    }
+  } finally {
+    exportBusy = false;
   }
 }
 
@@ -726,30 +721,36 @@ function csvCell(v) {
 }
 
 async function exportCsv() {
-  const head = ['дата', 'время', 'тип', 'голод_до', 'сытость_после', 'осознанно', 'контекст', 'текст', 'кг', 'талия'];
-  const rows = [];
-  Object.values(state.days).forEach((d) => {
-    if (d.wake) rows.push([d.date, timeStr(new Date(d.wake)), 'подъём', '', '', '', '', '', '', '']);
-  });
-  state.meals.forEach((m) => {
-    const d = new Date(m.ts);
-    rows.push([dateKey(d), timeStr(d), 'приём', m.before, m.after == null ? '' : m.after, m.mindful ? 1 : 0, (m.ctx || []).join(', '), m.note || '', '', '']);
-  });
-  state.notes.forEach((n) => {
-    const d = new Date(n.ts);
-    rows.push([dateKey(d), timeStr(d), 'запись', '', '', '', '', n.text, '', '']);
-  });
-  Object.values(state.focus).forEach((f) => {
-    const d = new Date(f.ts);
-    rows.push([dateKey(d), timeStr(d), 'фокус', '', '', '', '', f.text, '', '']);
-  });
-  state.weights.forEach((w) => {
-    rows.push([w.date, '', 'вес', '', '', '', '', '', fmt1(w.kg), w.waist ? fmt1(w.waist) : '']);
-  });
-  rows.sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
-  // ";" и BOM — чтобы Excel с русской локалью открыл файл корректно
-  const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(';')).join('\n'); // '﻿' = BOM для Excel
-  await shareFile(`daily-log-${dateKey(new Date())}.csv`, csv, 'text/csv');
+  if (exportBusy) return;
+  exportBusy = true;
+  try {
+    const head = ['дата', 'время', 'тип', 'голод_до', 'сытость_после', 'текст', 'кг', 'талия'];
+    const rows = [];
+    Object.values(state.days).forEach((d) => {
+      if (d.wake) rows.push([d.date, timeStr(new Date(d.wake)), 'подъём', '', '', '', '', '']);
+    });
+    state.meals.forEach((m) => {
+      const d = new Date(m.ts);
+      rows.push([dateKey(d), timeStr(d), 'приём', m.before, m.after == null ? '' : m.after, m.note || '', '', '']);
+    });
+    state.notes.forEach((n) => {
+      const d = new Date(n.ts);
+      rows.push([dateKey(d), timeStr(d), 'запись', '', '', n.text, '', '']);
+    });
+    Object.values(state.focus).forEach((f) => {
+      const d = new Date(f.ts);
+      rows.push([dateKey(d), timeStr(d), 'фокус', '', '', f.text, '', '']);
+    });
+    state.weights.forEach((w) => {
+      rows.push([w.date, '', 'вес', '', '', '', fmt1(w.kg), w.waist ? fmt1(w.waist) : '']);
+    });
+    rows.sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
+    // ";" и BOM — чтобы Excel с русской локалью открыл файл корректно
+    const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(';')).join('\n'); // '﻿' = BOM для Excel
+    await shareFile(`daily-log-${dateKey(new Date())}.csv`, csv, 'text/csv');
+  } finally {
+    exportBusy = false;
+  }
 }
 
 function validBackup(data) {
@@ -766,7 +767,9 @@ async function importFile(file) {
   }
   if (!validBackup(data)) { toast('Это не копия Daily Log'); return; }
   const clean = {
-    meals: data.meals.filter((m) => m && m.id && Number.isFinite(m.ts) && m.before >= 1 && m.before <= 10),
+    meals: data.meals
+      .filter((m) => m && m.id && Number.isFinite(m.ts) && m.before >= 1 && m.before <= 10)
+      .map((m) => ({ id: m.id, ts: m.ts, before: m.before, after: m.after == null ? null : m.after, note: typeof m.note === 'string' ? m.note : '' })),
     notes: (data.notes || []).filter((n) => n && n.id && Number.isFinite(n.ts) && typeof n.text === 'string'),
     days: data.days
       .filter((d) => d && /^\d{4}-\d{2}-\d{2}$/.test(d.date))
@@ -814,10 +817,6 @@ function onClick(e) {
     const v = Number(el.dataset.val);
     draft[el.dataset.kind] = draft[el.dataset.kind] === v ? null : v;
     syncSheet();
-  } else if (act === 'chip') {
-    const v = el.dataset.val;
-    if (draft.ctx.has(v)) draft.ctx.delete(v); else draft.ctx.add(v);
-    syncSheet();
   } else if (act === 'new-note') openNote(null);
   else if (act === 'edit-note') openNote(el.dataset.id);
   else if (act === 'close-note') $('#note-dialog').close();
@@ -838,7 +837,6 @@ function onClick(e) {
 function init() {
   $('[data-scale="before"]').innerHTML = scaleButtons('before');
   $('[data-scale="after"]').innerHTML = scaleButtons('after');
-  $('#ctx-chips').innerHTML = CONTEXTS.map((c) => `<button type="button" class="chip" data-act="chip" data-val="${esc(c)}">${esc(c)}</button>`).join('');
 
   document.addEventListener('click', onClick);
 
