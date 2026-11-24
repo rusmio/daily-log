@@ -3,7 +3,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const root = path.join(__dirname, 'daily-log');
+const root = __dirname;
 const port = 8123;
 const mimes = {
   '.html': 'text/html; charset=utf-8',
