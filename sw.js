@@ -1,5 +1,5 @@
 // Офлайн-кэш приложения. При изменении файлов увеличить версию.
-const CACHE = 'daily-log-v1';
+const CACHE = 'daily-log-v2';
 const ASSETS = [
   './',
   './index.html',

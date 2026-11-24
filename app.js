@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '2.0.0';
 
 const SCALE = {
   1: 'истощение, слабость',
@@ -15,15 +15,16 @@ const SCALE = {
   10: 'переела, дискомфорт',
 };
 const CONTEXTS = ['усталость', 'скука', 'стресс', 'награда', 'на ходу', 'за ребёнком', 'за компанией', 'перед экраном'];
-const DAY_FIELDS = [['sleep', 'Сон'], ['mood', 'Настроение'], ['energy', 'Энергия']];
-const CHART_DAYS = 14;
-const STORES = ['meals', 'days', 'weights'];
-const EXPORT_KEY = 'daily-log:last-export';
+const STORES = ['meals', 'notes', 'days', 'focus', 'weights'];
+const LS_DEFAULT_WAKE = 'daily-log:default-wake';
+const TABLE_DAYS = 30;
 
-const state = { meals: [], days: {}, weights: [] };
+const state = { meals: [], notes: [], days: {}, focus: {}, weights: [] };
 let db;
 let currentTab = 'today';
-let draft = null;
+let draft = null;       // черновик приёма пищи (шкалы, теги)
+let noteDraftId = null;
+let diaryFilter = 'all';
 
 // ---------- utils ----------
 
@@ -52,12 +53,6 @@ function humanDate(key) {
 function shortDate(key) {
   const d = parseKey(key);
   return `${d.getDate()}.${pad(d.getMonth() + 1)}`;
-}
-function lastDays(n) {
-  const now = new Date();
-  const out = [];
-  for (let i = n - 1; i >= 0; i--) out.push(dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - i)));
-  return out;
 }
 // "YYYY-MM-DDTHH:MM" → local Date (не полагаемся на разбор строки браузером)
 function parseLocal(v) {
@@ -88,16 +83,61 @@ function lsSet(key, val) {
 const isIos = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = () => navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
 
+// ---------- неделя и подъём ----------
+
+// ключ недели — дата её понедельника
+function mondayKey(d = new Date()) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return dateKey(x);
+}
+function defaultWakeTime() {
+  const v = lsGet(LS_DEFAULT_WAKE);
+  return /^\d{2}:\d{2}$/.test(v || '') ? v : '07:00';
+}
+function defaultWakeDate(base = new Date()) {
+  const m = /^(\d{2}):(\d{2})$/.exec(defaultWakeTime());
+  return m ? new Date(base.getFullYear(), base.getMonth(), base.getDate(), +m[1], +m[2]) : null;
+}
+
+// от чего считать таймер: от последнего приёма, иначе от подъёма (записанного или дефолтного)
+function timerState() {
+  const today = dateKey(new Date());
+  const meals = mealsOn(today);
+  const last = meals[meals.length - 1];
+  if (last) return { base: last.ts, cap: 'с последнего приёма пищи' };
+  const rec = state.days[today];
+  if (rec && rec.wake) return { base: rec.wake, cap: 'с подъёма' };
+  const d = defaultWakeDate();
+  if (d && d.getTime() <= Date.now()) return { base: d.getTime(), cap: 'с подъёма' };
+  return null;
+}
+function fmtPassed(ms) {
+  const min = Math.max(0, Math.floor(ms / 60000));
+  const h = Math.floor(min / 60);
+  return h ? `${h}:${pad(min % 60)}` : `${min} мин`;
+}
+function updateTimer() {
+  const timeEl = $('#timer-time');
+  const capEl = $('#timer-cap');
+  if (!timeEl) return;
+  const t = timerState();
+  timeEl.textContent = t ? fmtPassed(Date.now() - t.base) : '—';
+  capEl.textContent = t ? t.cap : 'подъём не записан';
+}
+
 // ---------- storage (IndexedDB) ----------
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('daily-log', 1);
+    const req = indexedDB.open('daily-log', 2);
     req.onupgradeneeded = () => {
       const d = req.result;
-      d.createObjectStore('meals', { keyPath: 'id' });
-      d.createObjectStore('days', { keyPath: 'date' });
-      d.createObjectStore('weights', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('meals')) d.createObjectStore('meals', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('notes')) d.createObjectStore('notes', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('days')) d.createObjectStore('days', { keyPath: 'date' });
+      if (!d.objectStoreNames.contains('focus')) d.createObjectStore('focus', { keyPath: 'week' });
+      if (!d.objectStoreNames.contains('weights')) d.createObjectStore('weights', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -122,7 +162,9 @@ function replaceAll(data) {
     const t = db.transaction(STORES, 'readwrite');
     STORES.forEach((s) => t.objectStore(s).clear());
     data.meals.forEach((m) => t.objectStore('meals').put(m));
+    data.notes.forEach((n) => t.objectStore('notes').put(n));
     data.days.forEach((d) => t.objectStore('days').put(d));
+    (data.focus || []).forEach((f) => t.objectStore('focus').put(f));
     data.weights.forEach((w) => t.objectStore('weights').put(w));
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
@@ -131,9 +173,11 @@ function replaceAll(data) {
 }
 
 async function load() {
-  const [meals, days, weights] = await Promise.all(STORES.map(getAll));
+  const [meals, notes, days, focus, weights] = await Promise.all(STORES.map(getAll));
   state.meals = meals.sort((a, b) => a.ts - b.ts);
+  state.notes = notes.sort((a, b) => a.ts - b.ts);
   state.days = Object.fromEntries(days.map((d) => [d.date, d]));
+  state.focus = Object.fromEntries(focus.map((f) => [f.week, f]));
   state.weights = weights.sort((a, b) => a.date.localeCompare(b.date));
 }
 
@@ -141,30 +185,9 @@ async function load() {
 
 function render() {
   if (currentTab === 'today') renderToday();
-  else if (currentTab === 'trends') renderTrends();
-  else renderData();
-}
-
-function exportOverdue() {
-  if (!state.meals.length) return false;
-  const last = Number(lsGet(EXPORT_KEY));
-  const since = last || state.meals[0].ts;
-  return Date.now() - since > 7 * 864e5;
-}
-
-function mealRow(m) {
-  const tags = [];
-  if (m.mindful) tags.push('осознанно');
-  tags.push(...(m.ctx || []));
-  if (m.note) tags.push(`«${m.note}»`);
-  const after = m.after == null
-    ? '<span class="pending">оценить сытость</span>'
-    : `сытость <b>${m.after}</b>`;
-  return `<button type="button" class="meal" data-act="edit-meal" data-id="${esc(m.id)}">
-    <span class="row"><span class="time">${timeStr(new Date(m.ts))}</span>
-    <span>голод <b>${m.before}</b> → ${after}</span></span>
-    ${tags.length ? `<span class="tags">${esc(tags.join(' · '))}</span>` : ''}
-  </button>`;
+  else if (currentTab === 'diary') renderDiary();
+  else if (currentTab === 'dynamics') renderDynamics();
+  else renderSettings();
 }
 
 function renderToday() {
@@ -172,79 +195,137 @@ function renderToday() {
   $('#subtitle').textContent = humanDate(today);
   const meals = mealsOn(today);
   const rated = meals.filter((m) => m.after != null);
-  const stopped = rated.filter((m) => m.after <= 7).length;
-  const pending = state.meals.filter((m) => m.after == null && Date.now() - m.ts < 2 * 864e5);
   const day = state.days[today] || {};
+  const focus = state.focus[mondayKey()];
 
   let html = '';
   if (isIos() && !isStandalone()) {
     html += `<div class="card note"><p><b>Установите на экран «Домой»</b>: кнопка «Поделиться» → «На экран „Домой“».</p>
       <p class="muted">Данные во вкладке Safari и в установленном приложении хранятся раздельно, поэтому записывайте только через иконку.</p></div>`;
   }
-  if (exportOverdue()) {
-    html += `<div class="card note"><p><b>Пора сделать резервную копию.</b> Данные хранятся только в этом телефоне.</p>
-      <button type="button" class="secondary" data-act="go-data">Перейти в «Данные»</button></div>`;
-  }
+
+  html += '<div class="card timer" role="timer"><b id="timer-time">—</b><span id="timer-cap"></span></div>';
+
+  html += `<button type="button" class="card asbtn" data-act="open-focus">
+    <h2>Фокус недели</h2>
+    ${focus && focus.text ? `<p class="focus-text">${esc(focus.text)}</p>` : '<p class="focus-empty">Какой фокус на этой неделе? Нажмите, чтобы записать.</p>'}
+  </button>`;
 
   html += '<button type="button" class="primary big" data-act="new-meal">+ Записать приём пищи</button>';
+  html += '<button type="button" class="secondary big" data-act="new-note">+ Запись: эмоции, ощущения</button>';
+
+  const defWake = defaultWakeDate();
+  if (day.wake) {
+    html += `<button type="button" class="wake" data-act="open-wake">
+      <span class="wlabel">Подъём</span>
+      <span><b>${timeStr(new Date(day.wake))}</b> <span class="edit">изменить</span></span>
+    </button>`;
+  } else if (defWake && defWake.getTime() <= Date.now()) {
+    html += `<button type="button" class="wake" data-act="open-wake">
+      <span class="wlabel">Подъём</span>
+      <span><b>${timeStr(defWake)}</b> <span class="def">по умолчанию</span> <span class="edit">изменить</span></span>
+    </button>`;
+  } else {
+    html += `<button type="button" class="wake" data-act="open-wake">
+      <span class="wlabel">Подъём</span>
+      <span><span class="def">не записан</span> <span class="edit">записать</span></span>
+    </button>`;
+  }
 
   html += `<div class="tiles">
     <div class="tile"><b>${meals.length}</b><span>приёмов сегодня</span></div>
     <div class="tile"><b>${fmt1(avg(meals.map((m) => m.before)))}</b><span>средний голод до еды</span></div>
-    <div class="tile"><b>${rated.length ? `${stopped}/${rated.length}` : '—'}</b><span>остановилась на&nbsp;7 и&nbsp;ниже</span></div>
+    <div class="tile"><b>${rated.length ? fmt1(avg(rated.map((m) => m.after))) : '—'}</b><span>средняя сытость после еды</span></div>
   </div>`;
 
-  if (pending.length) {
-    html += `<div class="card"><h2>Оценить сытость</h2>${pending.map(mealRow).join('')}</div>`;
-  }
-
-  const done = meals.filter((m) => m.after != null);
-  html += `<div class="card"><h2>Записи за сегодня</h2>${
-    done.length ? done.map(mealRow).join('') : '<p class="muted">Пока пусто. Перед едой нажмите большую кнопку и отметьте голод.</p>'
-  }</div>`;
-
-  html += `<div class="card"><h2>Как день</h2>${DAY_FIELDS.map(([f, label]) => `
-    <div class="rate"><span>${label}</span><div class="opts">${[1, 2, 3, 4, 5].map((v) =>
-      `<button type="button" class="opt" data-act="day" data-field="${f}" data-val="${v}" aria-pressed="${day[f] === v}">${v}</button>`).join('')}
-    </div></div>`).join('')}
-    <p class="hint">1 — очень плохо, 5 — отлично</p></div>`;
-
-  html += `<div class="card"><h2>Спринт 1: наблюдение</h2>
-    <p>Ничего не меняем, просто отмечаем голод до еды и сытость после. Цель — хотя бы половина приёмов пищи.</p>
-    <p class="muted">Ориентиры: 3–4 — хорошее время поесть, 6–7 — хорошее время остановиться.</p></div>`;
-
   $('#view-today').innerHTML = html;
+  updateTimer();
+}
+
+function diaryRow(it) {
+  const t = timeStr(new Date(it.ts));
+  if (it.kind === 'meal') {
+    const m = it.ref;
+    const tags = [];
+    if (m.mindful) tags.push('осознанно');
+    tags.push(...(m.ctx || []));
+    const after = m.after == null
+      ? '<span class="pending">оценить сытость</span>'
+      : `сытость <b>${m.after}</b>`;
+    const tail = m.note ? ` · «${esc(m.note)}»` : '';
+    return `<button type="button" class="entry" data-act="edit-meal" data-id="${esc(m.id)}">
+      <span class="row"><span class="time">${t}</span><span>🍽 голод <b>${m.before}</b> → ${after}</span></span>
+      ${tags.length ? `<span class="tags">${esc(tags.join(' · '))}${tail}</span>` : m.note ? `<span class="tags">«${esc(m.note)}»</span>` : ''}
+    </button>`;
+  }
+  if (it.kind === 'note') {
+    return `<button type="button" class="entry" data-act="edit-note" data-id="${esc(it.ref.id)}">
+      <span class="row"><span class="time">${t}</span><span>✎ ${esc(it.ref.text)}</span></span>
+    </button>`;
+  }
+  return `<button type="button" class="entry focus" data-act="goto-focus">
+    <span class="row"><span class="time">${t}</span><span>📌 Фокус недели: ${esc(it.ref.text)}</span></span>
+  </button>`;
+}
+
+function renderDiary() {
+  $('#subtitle').textContent = '';
+  const items = [];
+  if (diaryFilter !== 'notes') state.meals.forEach((m) => items.push({ ts: m.ts, kind: 'meal', ref: m }));
+  if (diaryFilter !== 'meals') state.notes.forEach((n) => items.push({ ts: n.ts, kind: 'note', ref: n }));
+  if (diaryFilter === 'all') Object.values(state.focus).forEach((f) => items.push({ ts: f.ts, kind: 'focus', ref: f }));
+
+  const groups = new Map();
+  items.forEach((it) => {
+    const k = dateKey(new Date(it.ts));
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(it);
+  });
+  const keys = [...groups.keys()].sort().reverse();
+  const today = dateKey(new Date());
+  const yd = new Date();
+  yd.setDate(yd.getDate() - 1);
+  const ykey = dateKey(yd);
+
+  let html = `<div class="chips">${[['all', 'Все'], ['meals', 'Приёмы'], ['notes', 'Записи']].map(([v, l]) =>
+    `<button type="button" class="chip" data-act="diary-filter" data-val="${v}" aria-pressed="${diaryFilter === v}">${l}</button>`).join('')}</div>`;
+
+  if (!keys.length) html += '<div class="card"><p class="muted">Пока пусто. Записи появятся здесь.</p></div>';
+
+  keys.forEach((k) => {
+    const label = k === today ? `Сегодня, ${humanDate(k)}` : k === ykey ? `Вчера, ${humanDate(k)}` : humanDate(k);
+    const rows = groups.get(k).sort((a, b) => a.ts - b.ts).map(diaryRow).join('');
+    html += `<div class="day-group" id="day-${k}"><p class="day-head">${label}</p>${rows}</div>`;
+  });
+
+  $('#view-diary').innerHTML = html;
 }
 
 function dayStats(key) {
   const ms = mealsOn(key);
-  const after = ms.filter((m) => m.after != null).map((m) => m.after);
+  const rated = ms.filter((m) => m.after != null);
   return {
     key,
     n: ms.length,
     before: avg(ms.map((m) => m.before)),
-    after: avg(after),
+    after: rated.length ? avg(rated.map((m) => m.after)) : null,
     mindful: ms.filter((m) => m.mindful).length,
-    day: state.days[key] || {},
+    wake: state.days[key] && state.days[key].wake,
   };
 }
 
-function renderTrends() {
+function renderDynamics() {
   $('#subtitle').textContent = '';
-  const stats = lastDays(CHART_DAYS).map(dayStats);
   const last = state.weights[state.weights.length - 1];
   const first = state.weights[0];
 
-  let html = `<div class="card"><h2>Голод и сытость, ${CHART_DAYS} дней</h2>
-    <div class="legend"><span><i style="background:var(--s1)"></i>голод до еды</span><span><i style="background:var(--s2)"></i>сытость после</span></div>
-    <div class="chart" id="hunger-chart"></div>
-    <p class="hint">Средние за день. Голубая полоса (3–4) — хорошее время поесть, оранжевая (6–7) — хорошее время остановиться. Нажмите на день, чтобы увидеть значения.</p></div>`;
-
-  html += `<div class="card"><h2>Вес</h2>`;
+  let html = `<div class="card"><h2>Вес</h2>`;
   if (last) {
     const diff = last.kg - first.kg;
     html += `<div class="hero"><b>${fmt1(last.kg)} кг</b><span class="muted">${
-      state.weights.length > 1 ? `${diff > 0 ? '+' : diff < 0 ? '−' : '±'}${fmt1(Math.abs(diff))} кг с ${shortDate(first.date)}` : 'первая запись'
+      state.weights.length > 1
+        ? diff === 0 ? 'без изменений' : `${diff > 0 ? '+' : '−'}${fmt1(Math.abs(diff))} кг с ${shortDate(first.date)}`
+        : 'первая запись'
     }</span></div><div class="chart" id="weight-chart"></div>`;
   } else {
     html += '<p class="muted">Взвешивайтесь раз в неделю, в одно и то же время. Это тренд, а не оценка.</p>';
@@ -262,52 +343,46 @@ function renderTrends() {
   }
   html += '</div>';
 
+  const keys = new Set();
+  state.meals.forEach((m) => keys.add(mealDay(m)));
+  Object.keys(state.days).forEach((k) => { if (state.days[k].wake) keys.add(k); });
+  const stats = [...keys].sort().reverse().slice(0, TABLE_DAYS).map(dayStats);
+
   html += `<div class="card"><h2>По дням</h2><div class="table-wrap"><table>
-    <thead><tr><th>День</th><th>Приёмы</th><th>Голод</th><th>Сытость</th><th>Осозн.</th><th>Сон</th><th>Настр.</th><th>Энергия</th></tr></thead>
-    <tbody>${stats.slice().reverse().map((s) => `<tr>
-      <td>${shortDate(s.key)} ${DOW[parseKey(s.key).getDay()]}</td><td>${s.n || '—'}</td><td>${fmt1(s.before)}</td><td>${fmt1(s.after)}</td>
-      <td>${s.n ? s.mindful : '—'}</td><td>${s.day.sleep || '—'}</td><td>${s.day.mood || '—'}</td><td>${s.day.energy || '—'}</td></tr>`).join('')}
-    </tbody></table></div></div>`;
+    <thead><tr><th>День</th><th>Подъём</th><th>Приёмы</th><th>Голод</th><th>Сытость</th><th>Осозн.</th></tr></thead>
+    <tbody>${stats.map((s) => `<tr data-act="diary-day" data-day="${s.key}">
+      <td>${shortDate(s.key)} ${DOW[parseKey(s.key).getDay()]}</td>
+      <td>${s.wake ? timeStr(new Date(s.wake)) : '—'}</td>
+      <td>${s.n || '—'}</td>
+      <td>${fmt1(s.before)}</td>
+      <td>${s.after == null ? '—' : fmt1(s.after)}</td>
+      <td>${s.n ? `${s.mindful}/${s.n}` : '—'}</td></tr>`).join('')}
+    </tbody></table></div>
+    <p class="hint">Тап по строке — открыть день во «Дневнике». Голод и сытость — средние за день.</p></div>`;
 
-  $('#view-trends').innerHTML = html;
-  drawCharts();
-}
-
-function drawCharts() {
-  const hc = $('#hunger-chart');
-  if (hc) hungerChart(hc, lastDays(CHART_DAYS).map(dayStats));
+  $('#view-dynamics').innerHTML = html;
   const wc = $('#weight-chart');
   if (wc) weightChart(wc);
 }
 
-function renderData() {
+function renderSettings() {
   $('#subtitle').textContent = '';
-  const last = Number(lsGet(EXPORT_KEY));
-  const filledDays = Object.keys(state.days).length;
-  $('#view-data').innerHTML = `
-    <div class="card"><h2>Что сохранено</h2>
-      <p>Приёмов пищи: <b>${state.meals.length}</b> · отметок дня: <b>${filledDays}</b> · взвешиваний: <b>${state.weights.length}</b></p>
-      <p class="muted">Последняя резервная копия: ${last ? new Date(last).toLocaleDateString('ru-RU') : 'ещё не было'}</p>
-      <p class="muted" id="persist-status"></p>
+  $('#view-settings').innerHTML = `
+    <div class="card"><h2>Подъём по умолчанию</h2>
+      <label class="field"><span>Время</span><input type="time" id="default-wake" value="${esc(defaultWakeTime())}"></label>
+      <p class="hint">Используется для таймера, пока сегодняшний подъём не записан.</p>
     </div>
     <div class="card stack"><h2>Резервная копия</h2>
       <button type="button" class="primary" data-act="export-json">Сохранить копию (JSON)</button>
       <button type="button" class="secondary" data-act="export-csv">Выгрузить таблицу (CSV)</button>
       <button type="button" class="secondary" data-act="import">Восстановить из копии</button>
-      <p class="hint">JSON — полная копия для восстановления. CSV — таблица приёмов пищи с отметками дня, её удобно открыть в Excel или отправить на разбор.</p>
+      <p class="hint">JSON — полная копия для восстановления. CSV — таблица для анализа.</p>
     </div>
     <div class="card"><h2>Важно</h2>
       <p>Все данные хранятся только в этом телефоне и никуда не отправляются.</p>
       <p class="muted">Если удалить иконку с экрана «Домой», данные удалятся вместе с ней. Делайте копию раз в неделю и сохраняйте её в «Файлы» или в «Избранное» Telegram.</p>
     </div>
     <p class="hint" style="text-align:center">Daily Log ${APP_VERSION}</p>`;
-
-  if (navigator.storage && navigator.storage.persisted) {
-    navigator.storage.persisted().then((p) => {
-      const el = $('#persist-status');
-      if (el) el.textContent = p ? 'Хранилище защищено от автоочистки.' : '';
-    }).catch(() => {});
-  }
 }
 
 // ---------- charts (inline SVG) ----------
@@ -374,53 +449,6 @@ function svgEl(W, H) {
   svg.setAttribute('height', H);
   svg.setAttribute('role', 'img');
   return svg;
-}
-
-function hungerChart(el, stats) {
-  const W = el.clientWidth || 320;
-  const H = 210;
-  const m = { l: 22, r: 8, t: 12, b: 24 };
-  const iw = W - m.l - m.r;
-  const ih = H - m.t - m.b;
-  const n = stats.length;
-  const x = (i) => m.l + (n === 1 ? iw / 2 : (i * iw) / (n - 1));
-  const y = (v) => m.t + ih - ((v - 1) / 9) * ih;
-  const xs = stats.map((_, i) => x(i));
-
-  let s = '';
-  s += `<rect x="${m.l}" y="${y(4)}" width="${iw}" height="${y(3) - y(4)}" fill="var(--band-start)"/>`;
-  s += `<rect x="${m.l}" y="${y(7)}" width="${iw}" height="${y(6) - y(7)}" fill="var(--band-stop)"/>`;
-  [2, 4, 6, 8, 10].forEach((v) => {
-    s += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/>`;
-    s += `<text x="${m.l - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
-  });
-  s += `<line class="base" x1="${m.l}" x2="${W - m.r}" y1="${y(1)}" y2="${y(1)}"/>`;
-  stats.forEach((st, i) => {
-    if ((n - 1 - i) % 3 === 0) {
-      s += `<text x="${xs[i]}" y="${H - 6}" text-anchor="middle">${shortDate(st.key)}</text>`;
-    }
-  });
-  s += `<line class="cross" y1="${m.t}" y2="${y(1)}" x1="0" x2="0"/>`;
-
-  [['before', 'var(--s1)'], ['after', 'var(--s2)']].forEach(([k, color]) => {
-    const pts = stats.map((st, i) => (st[k] == null ? null : [xs[i], y(st[k])]));
-    s += `<path class="line" stroke="${color}" d="${linePath(pts)}"/>`;
-    pts.forEach((p) => { if (p) s += `<circle class="dot" cx="${p[0]}" cy="${p[1]}" r="4" fill="${color}"/>`; });
-  });
-
-  const svg = svgEl(W, H);
-  svg.setAttribute('aria-label', 'Средний голод до еды и сытость после по дням');
-  svg.innerHTML = s;
-  el.innerHTML = '';
-  el.appendChild(svg);
-
-  attachTip(el, svg, xs, (i) => {
-    const st = stats[i];
-    if (!st.n) return `<b>${humanDate(st.key)}</b><br>нет записей`;
-    return `<b>${humanDate(st.key)}</b> · приёмов: ${st.n}<br>
-      <i style="background:var(--s1)"></i>голод до: ${fmt1(st.before)}<br>
-      <i style="background:var(--s2)"></i>сытость после: ${fmt1(st.after)}`;
-  }, 0);
 }
 
 function weightChart(el) {
@@ -499,11 +527,11 @@ function openMeal(id) {
   form.ts.value = `${dateKey(d)}T${timeStr(d)}`;
   form.mindful.checked = m ? !!m.mindful : false;
   form.note.value = m ? m.note || '' : '';
-  $('#meal-title').textContent = m ? 'Запись' : 'Новый приём пищи';
+  $('#meal-title').textContent = m ? 'Приём пищи' : 'Новый приём пищи';
   $('[data-act="delete-meal"]').hidden = !m;
   syncSheet();
   $('#meal-dialog').showModal();
-  form.scrollTop = 0;
+  $('#meal-dialog').scrollTop = 0;
 }
 
 async function saveMeal(e) {
@@ -537,16 +565,102 @@ async function deleteMeal() {
   render();
 }
 
-// ---------- day & weight ----------
+// ---------- note sheet ----------
 
-async function setDay(field, val) {
-  const key = dateKey(new Date());
-  const day = Object.assign({ date: key }, state.days[key]);
-  day[field] = day[field] === val ? null : val;
-  await put('days', day);
-  state.days[key] = day;
+function openNote(id) {
+  const n = id ? state.notes.find((x) => x.id === id) : null;
+  noteDraftId = n ? n.id : null;
+  const form = $('#note-form');
+  const d = n ? new Date(n.ts) : new Date();
+  form.ts.value = `${dateKey(d)}T${timeStr(d)}`;
+  form.text.value = n ? n.text : '';
+  $('#note-title').textContent = n ? 'Запись' : 'Новая запись';
+  $('[data-act="delete-note"]').hidden = !n;
+  $('#note-dialog').showModal();
+  $('#note-dialog').scrollTop = 0;
+}
+
+async function saveNote(e) {
+  e.preventDefault();
+  const form = $('#note-form');
+  const d = parseLocal(form.ts.value);
+  const text = form.text.value.trim();
+  if (!d) { toast('Укажите время'); return; }
+  if (!text) { toast('Введите текст'); return; }
+  const note = { id: noteDraftId || uid(), ts: d.getTime(), text };
+  await put('notes', note);
+  state.notes = state.notes.filter((x) => x.id !== note.id).concat(note).sort((a, b) => a.ts - b.ts);
+  $('#note-dialog').close();
+  toast('Сохранено');
   render();
 }
+
+async function deleteNote() {
+  if (!noteDraftId || !confirm('Удалить эту запись?')) return;
+  await del('notes', noteDraftId);
+  state.notes = state.notes.filter((x) => x.id !== noteDraftId);
+  $('#note-dialog').close();
+  toast('Удалено');
+  render();
+}
+
+// ---------- wake & focus ----------
+
+function openWake() {
+  const form = $('#wake-form');
+  const today = dateKey(new Date());
+  const rec = state.days[today];
+  let d;
+  if (rec && rec.wake) d = new Date(rec.wake);
+  else {
+    d = defaultWakeDate();
+    if (!d || d.getTime() > Date.now()) d = new Date();
+  }
+  form.ts.value = `${dateKey(d)}T${timeStr(d)}`;
+  $('#wake-dialog').showModal();
+}
+
+async function saveWake(e) {
+  e.preventDefault();
+  const form = $('#wake-form');
+  const d = parseLocal(form.ts.value);
+  if (!d) { toast('Укажите время'); return; }
+  const key = dateKey(d);
+  const day = Object.assign({}, state.days[key], { date: key, wake: d.getTime() });
+  await put('days', day);
+  state.days[key] = day;
+  $('#wake-dialog').close();
+  toast('Подъём записан');
+  render();
+}
+
+function openFocus() {
+  const f = state.focus[mondayKey()];
+  $('#focus-form').text.value = f && f.text ? f.text : '';
+  $('#focus-dialog').showModal();
+}
+
+async function saveFocus(e) {
+  e.preventDefault();
+  const text = $('#focus-form').text.value.trim();
+  if (!text) { toast('Введите фокус'); return; }
+  const rec = { week: mondayKey(), ts: Date.now(), text };
+  await put('focus', rec);
+  state.focus[rec.week] = rec;
+  $('#focus-dialog').close();
+  toast('Фокус сохранён');
+  render();
+}
+
+function gotoDiaryDay(key) {
+  switchTab('diary');
+  setTimeout(() => {
+    const el = document.getElementById(`day-${key}`);
+    if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }, 60);
+}
+
+// ---------- weight ----------
 
 async function saveWeight(form) {
   const kg = parseNum(form.kg.value);
@@ -591,15 +705,16 @@ async function shareFile(name, text, type) {
 async function exportJson() {
   const data = {
     app: 'daily-log',
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     meals: state.meals,
+    notes: state.notes,
     days: Object.values(state.days),
+    focus: Object.values(state.focus),
     weights: state.weights,
   };
   const ok = await shareFile(`daily-log-${dateKey(new Date())}.json`, JSON.stringify(data, null, 1), 'application/json');
   if (ok) {
-    lsSet(EXPORT_KEY, String(Date.now()));
     toast('Копия готова');
     render();
   }
@@ -611,14 +726,29 @@ function csvCell(v) {
 }
 
 async function exportCsv() {
-  const head = ['дата', 'время', 'голод_до', 'сытость_после', 'осознанно', 'контекст', 'заметка', 'сон', 'настроение', 'энергия'];
-  const rows = state.meals.map((m) => {
-    const d = new Date(m.ts);
-    const day = state.days[dateKey(d)] || {};
-    return [dateKey(d), timeStr(d), m.before, m.after, m.mindful ? 1 : 0, (m.ctx || []).join(', '), m.note, day.sleep, day.mood, day.energy];
+  const head = ['дата', 'время', 'тип', 'голод_до', 'сытость_после', 'осознанно', 'контекст', 'текст', 'кг', 'талия'];
+  const rows = [];
+  Object.values(state.days).forEach((d) => {
+    if (d.wake) rows.push([d.date, timeStr(new Date(d.wake)), 'подъём', '', '', '', '', '', '', '']);
   });
+  state.meals.forEach((m) => {
+    const d = new Date(m.ts);
+    rows.push([dateKey(d), timeStr(d), 'приём', m.before, m.after == null ? '' : m.after, m.mindful ? 1 : 0, (m.ctx || []).join(', '), m.note || '', '', '']);
+  });
+  state.notes.forEach((n) => {
+    const d = new Date(n.ts);
+    rows.push([dateKey(d), timeStr(d), 'запись', '', '', '', '', n.text, '', '']);
+  });
+  Object.values(state.focus).forEach((f) => {
+    const d = new Date(f.ts);
+    rows.push([dateKey(d), timeStr(d), 'фокус', '', '', '', '', f.text, '', '']);
+  });
+  state.weights.forEach((w) => {
+    rows.push([w.date, '', 'вес', '', '', '', '', '', fmt1(w.kg), w.waist ? fmt1(w.waist) : '']);
+  });
+  rows.sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
   // ";" и BOM — чтобы Excel с русской локалью открыл файл корректно
-  const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(';')).join('\n');
+  const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(';')).join('\n'); // '﻿' = BOM для Excel
   await shareFile(`daily-log-${dateKey(new Date())}.csv`, csv, 'text/csv');
 }
 
@@ -637,10 +767,14 @@ async function importFile(file) {
   if (!validBackup(data)) { toast('Это не копия Daily Log'); return; }
   const clean = {
     meals: data.meals.filter((m) => m && m.id && Number.isFinite(m.ts) && m.before >= 1 && m.before <= 10),
-    days: data.days.filter((d) => d && /^\d{4}-\d{2}-\d{2}$/.test(d.date)),
+    notes: (data.notes || []).filter((n) => n && n.id && Number.isFinite(n.ts) && typeof n.text === 'string'),
+    days: data.days
+      .filter((d) => d && /^\d{4}-\d{2}-\d{2}$/.test(d.date))
+      .map((d) => (Number.isFinite(d.wake) ? d : Object.assign({}, d, { wake: undefined }))),
+    focus: (data.focus || []).filter((f) => f && /^\d{4}-\d{2}-\d{2}$/.test(f.week) && typeof f.text === 'string'),
     weights: data.weights.filter((w) => w && w.id && /^\d{4}-\d{2}-\d{2}$/.test(w.date) && Number.isFinite(w.kg)),
   };
-  const msg = `Заменить текущие данные копией?\n\nВ копии: приёмов пищи ${clean.meals.length}, отметок дня ${clean.days.length}, взвешиваний ${clean.weights.length}.\nСейчас в телефоне: ${state.meals.length} / ${Object.keys(state.days).length} / ${state.weights.length}.`;
+  const msg = `Заменить текущие данные копией?\n\nВ копии: приёмов пищи ${clean.meals.length}, записей ${clean.notes.length}, дней с данными ${clean.days.length}, взвешиваний ${clean.weights.length}.`;
   if (!confirm(msg)) return;
   await replaceAll(clean);
   await load();
@@ -650,11 +784,13 @@ async function importFile(file) {
 
 // ---------- wiring ----------
 
+const TITLES = { today: 'Сегодня', diary: 'Дневник', dynamics: 'Динамика', settings: 'Настройки' };
+
 function switchTab(tab) {
   currentTab = tab;
   document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.view').forEach((v) => { v.hidden = v.id !== `view-${tab}`; });
-  $('#title').textContent = { today: 'Сегодня', trends: 'Динамика', data: 'Данные' }[tab];
+  $('#title').textContent = TITLES[tab];
   render();
   window.scrollTo(0, 0);
 }
@@ -663,8 +799,7 @@ function onClick(e) {
   const tabBtn = e.target.closest('[data-tab]');
   if (tabBtn) { switchTab(tabBtn.dataset.tab); return; }
 
-  const dialog = $('#meal-dialog');
-  if (e.target === dialog) { dialog.close(); return; }
+  if (e.target.tagName === 'DIALOG') { e.target.close(); return; }
 
   const el = e.target.closest('[data-act]');
   if (!el) return;
@@ -673,7 +808,7 @@ function onClick(e) {
 
   if (act === 'new-meal') openMeal(null);
   else if (act === 'edit-meal') openMeal(el.dataset.id);
-  else if (act === 'close-meal') dialog.close();
+  else if (act === 'close-meal') $('#meal-dialog').close();
   else if (act === 'delete-meal') run(deleteMeal());
   else if (act === 'scale') {
     const v = Number(el.dataset.val);
@@ -683,9 +818,18 @@ function onClick(e) {
     const v = el.dataset.val;
     if (draft.ctx.has(v)) draft.ctx.delete(v); else draft.ctx.add(v);
     syncSheet();
-  } else if (act === 'day') run(setDay(el.dataset.field, Number(el.dataset.val)));
+  } else if (act === 'new-note') openNote(null);
+  else if (act === 'edit-note') openNote(el.dataset.id);
+  else if (act === 'close-note') $('#note-dialog').close();
+  else if (act === 'delete-note') run(deleteNote());
+  else if (act === 'open-wake') openWake();
+  else if (act === 'close-wake') $('#wake-dialog').close();
+  else if (act === 'open-focus') openFocus();
+  else if (act === 'goto-focus') { switchTab('today'); openFocus(); }
+  else if (act === 'close-focus') $('#focus-dialog').close();
+  else if (act === 'diary-filter') { diaryFilter = el.dataset.val; render(); }
+  else if (act === 'diary-day') gotoDiaryDay(el.dataset.day);
   else if (act === 'del-weight') run(deleteWeight(el.dataset.id));
-  else if (act === 'go-data') switchTab('data');
   else if (act === 'export-json') run(exportJson());
   else if (act === 'export-csv') run(exportCsv());
   else if (act === 'import') $('#import-file').click();
@@ -697,24 +841,42 @@ function init() {
   $('#ctx-chips').innerHTML = CONTEXTS.map((c) => `<button type="button" class="chip" data-act="chip" data-val="${esc(c)}">${esc(c)}</button>`).join('');
 
   document.addEventListener('click', onClick);
-  $('#meal-form').addEventListener('submit', (e) => saveMeal(e).catch((err) => { console.error(err); toast('Ошибка сохранения'); }));
+
+  const catchSave = (fn) => (e) => fn(e).catch((err) => { console.error(err); toast('Ошибка сохранения'); });
+  $('#meal-form').addEventListener('submit', catchSave(saveMeal));
+  $('#note-form').addEventListener('submit', catchSave(saveNote));
+  $('#wake-form').addEventListener('submit', catchSave(saveWake));
+  $('#focus-form').addEventListener('submit', catchSave(saveFocus));
+
   document.addEventListener('submit', (e) => {
     if (e.target.id !== 'weight-form') return;
     e.preventDefault();
     saveWeight(e.target).catch((err) => { console.error(err); toast('Ошибка сохранения'); });
   });
+
+  document.addEventListener('change', (e) => {
+    if (e.target.id === 'default-wake' && e.target.value) {
+      lsSet(LS_DEFAULT_WAKE, e.target.value);
+      toast('Сохранено');
+    }
+  });
+
   $('#import-file').addEventListener('change', (e) => {
     const file = e.target.files[0];
     e.target.value = '';
     if (file) importFile(file).catch((err) => { console.error(err); toast('Не удалось восстановить'); });
   });
 
-  // приложение может долго висеть в фоне — при возврате перерисовываем «сегодня»
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('#meal-dialog').open) render(); });
+  // таймер на «Сегодня» идёт сам; приложение может долго висеть в фоне —
+  // при возврате перерисовываем текущую вкладку
+  setInterval(() => { if (currentTab === 'today') updateTimer(); }, 30000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && ![...document.querySelectorAll('dialog')].some((d) => d.open)) render();
+  });
   let resizeTimer;
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => { if (currentTab === 'trends') drawCharts(); }, 150);
+    resizeTimer = setTimeout(() => { if (currentTab === 'dynamics') { const wc = $('#weight-chart'); if (wc) weightChart(wc); } }, 150);
   });
 }
 

@@ -116,26 +116,9 @@ button { cursor: pointer; border: 0; background: none; }
 .tile b { display: block; font-size: 24px; font-weight: 600; }
 .tile span { color: var(--ink-2); font-size: 13px; line-height: 1.25; display: block; }
 
-/* Meal list */
-.meal {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 10px 0;
-  border-top: 1px solid var(--border);
-  min-height: 44px;
-}
-.card h2 + .meal { border-top: 0; padding-top: 0; }
-.meal .row { display: flex; gap: 12px; align-items: baseline; }
-.meal .time { color: var(--ink-2); font-variant-numeric: tabular-nums; min-width: 44px; }
-.meal .pending { color: var(--accent); font-weight: 600; }
-.meal .tags { display: block; color: var(--ink-2); font-size: 13px; margin-left: 56px; }
+/* Meal list → заменён на .entry (см. ниже) */
 
-/* Rating rows (day check-in) */
-.rate { display: flex; align-items: center; gap: 8px; }
-.rate + .rate { margin-top: 8px; }
-.rate > span { flex: 0 0 96px; color: var(--ink-2); font-size: 15px; }
-.rate .opts { flex: 1; display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+/* Rating rows → убраны вместе с «Как день» */
 
 .opt {
   min-height: 44px;
@@ -298,3 +281,65 @@ tbody tr { border-top: 1px solid var(--border); }
   z-index: 20;
 }
 #toast.show { opacity: 1; }
+
+/* ---------- v2 ---------- */
+
+/* Timer */
+.timer { text-align: center; padding: 26px 16px 22px; }
+.timer b {
+  display: block;
+  font-size: 68px;
+  font-weight: 700;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -1px;
+}
+.timer span { display: block; margin-top: 6px; color: var(--muted); font-size: 14px; }
+
+/* Big secondary button */
+.secondary.big { width: 100%; min-height: 56px; font-size: 18px; font-weight: 600; }
+
+/* Card as button (фокус недели) */
+.card.asbtn { display: block; width: 100%; text-align: left; }
+.focus-text { white-space: pre-wrap; }
+.focus-empty { color: var(--muted); }
+
+/* Wake row */
+.wake {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  min-height: 48px;
+  text-align: left;
+}
+.wake .wlabel { color: var(--ink-2); }
+.wake b { font-variant-numeric: tabular-nums; }
+.wake .def { color: var(--muted); font-size: 13px; }
+.wake .edit { color: var(--accent); font-weight: 600; }
+
+/* Diary feed */
+.day-group { margin-top: 14px; }
+.day-head { margin: 0 0 6px 4px; font-weight: 600; color: var(--ink-2); font-size: 14px; }
+.entry {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-top: 8px;
+  min-height: 44px;
+}
+.entry .row { display: flex; gap: 10px; align-items: baseline; }
+.entry .row > span:last-child { flex: 1; overflow-wrap: anywhere; }
+.entry .time { color: var(--ink-2); font-variant-numeric: tabular-nums; min-width: 44px; flex: none; }
+.entry .tags { display: block; color: var(--ink-2); font-size: 13px; margin: 2px 0 0 54px; }
+.entry .pending { color: var(--accent); font-weight: 600; }
+.entry.focus { border-style: dashed; }
